@@ -1,9 +1,15 @@
+export type EvidenceUploadStatus = "pending" | "uploading" | "done" | "error";
+
 export type EvidenceDraft = {
   clientId: string;
   kind: "photo" | "video" | "file" | "link";
   file?: File;
   url?: string;
   title: string;
+  status: EvidenceUploadStatus;
+  errorMessage?: string;
+  /** Solo para fotos: URL de objeto local para mostrar una miniatura. */
+  previewUrl?: string;
 };
 
 export type WizardState = {

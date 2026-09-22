@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { ArrowLeft, ArrowRight } from "@phosphor-icons/react";
@@ -11,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent } from "@/components/ui/card";
 import type { TeamMember } from "@/lib/queries/roster";
 import type { Category } from "@/lib/queries/categories";
+import { validateEvidenceFile } from "@/lib/validation/evidence-file";
 import { MemberPicker } from "./member-picker";
 import { ChipPicker } from "./chip-picker";
 import { DictationTextarea } from "./dictation-textarea";
@@ -53,6 +55,11 @@ export function SessionWizard({
   const [step, setStep] = useState(0);
   const [state, setState] = useState<WizardState>(emptyWizardState);
   const [submitting, setSubmitting] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
+  const [savedSessionId, setSavedSessionId] = useState<string | null>(null);
 
   // Restaura un borrador guardado en este dispositivo (§28: formulario
   // abandonado no debe perder el trabajo). Los archivos adjuntos no se
@@ -123,10 +130,23 @@ export function SessionWizard({
     }
   })();
 
+  function patchEvidenceItem(clientId: string, patch: Partial<WizardState["evidence"][number]>) {
+    setState((current) => ({
+      ...current,
+      evidence: current.evidence.map((item) =>
+        item.clientId === clientId ? { ...item, ...patch } : item
+      ),
+    }));
+  }
+
   async function handleSubmit() {
     setSubmitting(true);
     const supabase = createClient();
 
+    // Paso 1: la sesión y sus vínculos de participantes/categorías son el
+    // núcleo del registro. Si esto falla, no hay nada que guardar todavía
+    // y abortamos por completo (comportamiento sin cambios).
+    let sessionId: string;
     try {
       const { data: session, error: sessionError } = await supabase
         .from("sessions")
@@ -148,7 +168,7 @@ export function SessionWizard({
         .single();
 
       if (sessionError) throw sessionError;
-      const sessionId = session.id as string;
+      sessionId = session.id as string;
 
       if (state.participantIds.length > 0) {
         const { error } = await supabase.from("session_participants").insert(
@@ -173,8 +193,34 @@ export function SessionWizard({
         );
         if (error) throw error;
       }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "No se pudo guardar la sesión. Intenta de nuevo."
+      );
+      setSubmitting(false);
+      return;
+    }
 
-      for (const item of state.evidence) {
+    // A partir de aquí la sesión YA existe. `savedSessionId` se marca de
+    // inmediato para que, si algo de la evidencia falla más abajo, el
+    // usuario nunca pueda volver a pulsar "Guardar sesión" y crear una
+    // sesión duplicada — la única salida que se le ofrece es ir a verla.
+    setSavedSessionId(sessionId);
+
+    // Paso 2: evidencia, un ítem a la vez. El fallo de uno NO aborta los
+    // demás ni pone en riesgo la sesión ya guardada.
+    const total = state.evidence.length;
+    let failedCount = 0;
+    const failedTitles: string[] = [];
+
+    for (let index = 0; index < state.evidence.length; index += 1) {
+      const item = state.evidence[index];
+      setUploadProgress({ current: index + 1, total });
+      patchEvidenceItem(item.clientId, { status: "uploading" });
+
+      try {
         if (item.kind === "link") {
           const { error } = await supabase.from("evidence").insert({
             kind: "link",
@@ -184,39 +230,52 @@ export function SessionWizard({
             uploaded_by: teamMember.id,
           });
           if (error) throw error;
-          continue;
+        } else if (item.file) {
+          const validation = validateEvidenceFile(item.file, item.kind);
+          if (!validation.ok) throw new Error(validation.message);
+
+          const path = `${seasonId}/session/${sessionId}/${crypto.randomUUID()}-${item.file.name}`;
+          const { error: uploadError } = await supabase.storage
+            .from("evidence")
+            .upload(path, item.file);
+          if (uploadError) throw uploadError;
+
+          const { error } = await supabase.from("evidence").insert({
+            kind: item.kind,
+            storage_path: path,
+            title: item.title,
+            session_id: sessionId,
+            uploaded_by: teamMember.id,
+          });
+          if (error) throw error;
         }
-
-        if (!item.file) continue;
-        const path = `${seasonId}/session/${sessionId}/${crypto.randomUUID()}-${item.file.name}`;
-        const { error: uploadError } = await supabase.storage
-          .from("evidence")
-          .upload(path, item.file);
-        if (uploadError) throw uploadError;
-
-        const { error } = await supabase.from("evidence").insert({
-          kind: item.kind,
-          storage_path: path,
-          title: item.title,
-          session_id: sessionId,
-          uploaded_by: teamMember.id,
+        patchEvidenceItem(item.clientId, { status: "done" });
+      } catch (error) {
+        failedCount += 1;
+        failedTitles.push(item.title);
+        patchEvidenceItem(item.clientId, {
+          status: "error",
+          errorMessage:
+            error instanceof Error ? error.message : "No se pudo subir.",
         });
-        if (error) throw error;
       }
+    }
 
-      clearDraft();
+    setUploadProgress(null);
+    clearDraft();
+    setSubmitting(false);
+
+    if (failedCount === 0) {
       toast.success("Sesión guardada.");
       router.push(`/sesiones/${sessionId}`);
       router.refresh();
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "No se pudo guardar la sesión. Intenta de nuevo."
-      );
-    } finally {
-      setSubmitting(false);
+      return;
     }
+
+    toast.error(
+      `Sesión guardada, pero ${failedCount} de ${total} evidencia(s) no se ` +
+        `pudo subir: ${failedTitles.join(", ")}. Revisa el detalle abajo.`
+    );
   }
 
   return (
@@ -363,6 +422,12 @@ export function SessionWizard({
           <EvidenceStep
             items={state.evidence}
             onChange={(items) => update("evidence", items)}
+            disabled={submitting || !!savedSessionId}
+            progressLabel={
+              uploadProgress
+                ? `Subiendo ${uploadProgress.current} de ${uploadProgress.total}…`
+                : undefined
+            }
           />
         )}
 
@@ -370,7 +435,7 @@ export function SessionWizard({
           <Button
             type="button"
             variant="ghost"
-            disabled={step === 0 || submitting}
+            disabled={step === 0 || submitting || !!savedSessionId}
             onClick={() => setStep((s) => Math.max(0, s - 1))}
             className="gap-1.5"
           >
@@ -388,9 +453,17 @@ export function SessionWizard({
               Siguiente
               <ArrowRight className="size-4" aria-hidden />
             </Button>
+          ) : savedSessionId ? (
+            <Button asChild>
+              <Link href={`/sesiones/${savedSessionId}`}>Ver sesión</Link>
+            </Button>
           ) : (
             <Button type="button" disabled={submitting} onClick={handleSubmit}>
-              {submitting ? "Guardando…" : "Guardar sesión"}
+              {submitting
+                ? uploadProgress
+                  ? `Subiendo ${uploadProgress.current} de ${uploadProgress.total}…`
+                  : "Guardando…"
+                : "Guardar sesión"}
             </Button>
           )}
         </div>

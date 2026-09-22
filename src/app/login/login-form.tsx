@@ -30,7 +30,13 @@ type Credentials = z.infer<typeof credentialsSchema>;
 export function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const nextPath = searchParams.get("next") ?? "/dashboard";
+  // Solo se acepta una ruta interna (empieza con "/" y no con "//", para
+  // no permitir que un ?next= manipulado saque al usuario del sitio).
+  const rawNext = searchParams.get("next");
+  const nextPath =
+    rawNext && rawNext.startsWith("/") && !rawNext.startsWith("//")
+      ? rawNext
+      : "/dashboard";
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [submitting, setSubmitting] = useState(false);
 

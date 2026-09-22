@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { getCurrentTeamMember } from "@/lib/queries/roster";
 import {
   Card,
   CardContent,
@@ -8,6 +9,8 @@ import {
   CardHeader,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DeleteSessionButton } from "@/components/session-delete-button";
 import {
   ArrowLeft,
   Image as ImageIcon,
@@ -15,10 +18,13 @@ import {
   Paperclip,
   LinkSimple,
   FileText,
+  PencilSimple,
+  Warning,
 } from "@phosphor-icons/react/dist/ssr";
 
 type SessionDetail = {
   id: string;
+  created_by: string;
   session_date: string;
   objective: string;
   what_happened: string;
@@ -68,20 +74,27 @@ export default async function SesionDetailPage({
   const { id } = await params;
   const supabase = await createClient();
 
-  const { data: session, error } = await supabase
-    .from("sessions")
-    .select(
-      `id, session_date, objective, what_happened, had_problem,
-       problem_description, decision, learning, next_step, created_at,
-       session_participants(team_members(id, full_name, nickname)),
-       session_categories(categories(id, label, kind))`
-    )
-    .eq("id", id)
-    .maybeSingle<SessionDetail>();
+  const [{ data: session, error }, currentMember] = await Promise.all([
+    supabase
+      .from("sessions")
+      .select(
+        `id, created_by, session_date, objective, what_happened, had_problem,
+         problem_description, decision, learning, next_step, created_at,
+         session_participants(team_members(id, full_name, nickname)),
+         session_categories(categories(id, label, kind))`
+      )
+      .eq("id", id)
+      .maybeSingle<SessionDetail>(),
+    getCurrentTeamMember(supabase),
+  ]);
 
   if (error || !session) notFound();
 
-  const { data: evidenceRows } = await supabase
+  const canEdit =
+    !!currentMember &&
+    (currentMember.id === session.created_by || currentMember.role === "admin");
+
+  const { data: evidenceRows, error: evidenceError } = await supabase
     .from("evidence")
     .select("id, kind, storage_path, external_url, title")
     .eq("session_id", id)
@@ -99,13 +112,26 @@ export default async function SesionDetailPage({
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-6 py-10">
-      <Link
-        href="/sesiones"
-        className="flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
-      >
-        <ArrowLeft className="size-4" aria-hidden />
-        Sesiones
-      </Link>
+      <div className="flex items-center justify-between gap-2">
+        <Link
+          href="/sesiones"
+          className="flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="size-4" aria-hidden />
+          Sesiones
+        </Link>
+        {canEdit && (
+          <div className="flex items-center gap-2">
+            <Button asChild variant="outline" size="sm" className="gap-1.5">
+              <Link href={`/sesiones/${session.id}/editar`}>
+                <PencilSimple className="size-4" aria-hidden />
+                Editar
+              </Link>
+            </Button>
+            <DeleteSessionButton sessionId={session.id} />
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-col gap-2">
         <p className="font-data text-sm text-muted-foreground">
@@ -148,7 +174,20 @@ export default async function SesionDetailPage({
 
       <div className="flex flex-col gap-3">
         <h2 className="font-heading text-lg font-semibold">Evidencia</h2>
-        {evidence.length === 0 && (
+        {evidenceError && (
+          <Card className="border-warning/40">
+            <CardHeader className="flex-row items-start gap-3 space-y-0">
+              <Warning className="mt-1 size-5 shrink-0 text-warning" aria-hidden />
+              <div>
+                <CardDescription>
+                  No se pudo cargar la evidencia de esta sesión. Detalle:{" "}
+                  {evidenceError.message}
+                </CardDescription>
+              </div>
+            </CardHeader>
+          </Card>
+        )}
+        {!evidenceError && evidence.length === 0 && (
           <Card>
             <CardHeader>
               <CardDescription>
