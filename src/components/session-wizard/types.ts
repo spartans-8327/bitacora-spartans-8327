@@ -25,6 +25,11 @@ export type WizardState = {
   learning: string;
   nextStep: string;
   evidence: EvidenceDraft[];
+  // Contexto opcional de Proyecto/Iteración (Fase 3, Bloque 5C). En el
+  // wizard de creación llegan de la URL, nunca de un selector nuevo. En
+  // la edición sí pueden cambiarse desde session-edit-form.tsx.
+  projectId: string | null;
+  iterationId: string | null;
 };
 
 export const emptyWizardState = (): WizardState => ({
@@ -40,4 +45,6 @@ export const emptyWizardState = (): WizardState => ({
   learning: "",
   nextStep: "",
   evidence: [],
+  projectId: null,
+  iterationId: null,
 });

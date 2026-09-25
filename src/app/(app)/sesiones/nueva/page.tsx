@@ -2,7 +2,12 @@ import { createClient } from "@/lib/supabase/server";
 import { getCurrentTeamMember, getActiveRoster } from "@/lib/queries/roster";
 import { getActiveCategories } from "@/lib/queries/categories";
 import { getActiveSeason } from "@/lib/queries/seasons";
-import { SessionWizard } from "@/components/session-wizard/session-wizard";
+import { getProjectById } from "@/lib/queries/projects";
+import { getIterationById } from "@/lib/queries/project-iterations";
+import {
+  SessionWizard,
+  type SessionWizardContext,
+} from "@/components/session-wizard/session-wizard";
 import {
   Card,
   CardDescription,
@@ -27,8 +32,13 @@ function BlockedState({ title, description }: { title: string; description: stri
   );
 }
 
-export default async function NuevaSesionPage() {
+export default async function NuevaSesionPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ projectId?: string; iterationId?: string }>;
+}) {
   const supabase = await createClient();
+  const resolvedSearchParams = await searchParams;
 
   let teamMember;
   let season;
@@ -71,6 +81,44 @@ export default async function NuevaSesionPage() {
     );
   }
 
+  // Contexto opcional de proyecto/iteración (?projectId=...&iterationId=...).
+  // Se valida aquí, en el servidor — el wizard nunca ofrece un selector
+  // para esto. Si el proyecto no existe/no es visible, o si la iteración
+  // no pertenece realmente a ese proyecto, el contexto correspondiente se
+  // descarta silenciosamente: la sesión sigue siendo válida, solo se crea
+  // sin ese vínculo en vez de mostrar un error duro que bloquee registrar
+  // una sesión independiente.
+  let context: SessionWizardContext | undefined;
+  try {
+    const { projectId, iterationId } = resolvedSearchParams;
+    if (projectId) {
+      const contextProject = await getProjectById(supabase, projectId);
+      if (contextProject) {
+        context = {
+          projectId: contextProject.id,
+          projectName: contextProject.name,
+        };
+        if (iterationId) {
+          const contextIteration = await getIterationById(
+            supabase,
+            iterationId,
+            contextProject.id
+          );
+          if (contextIteration) {
+            context.iterationId = contextIteration.id;
+            context.iterationLabel = `Iteración ${contextIteration.sequence}${
+              contextIteration.name ? ` · ${contextIteration.name}` : ""
+            }`;
+          }
+        }
+      }
+    }
+  } catch {
+    // Un fallo al resolver el contexto no debe impedir registrar una
+    // sesión independiente: se ignora y el wizard se abre sin contexto.
+    context = undefined;
+  }
+
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-10">
       <SessionWizard
@@ -79,6 +127,7 @@ export default async function NuevaSesionPage() {
         areas={categories.areas}
         activityTypes={categories.activityTypes}
         seasonId={season.id}
+        context={context}
       />
     </div>
   );

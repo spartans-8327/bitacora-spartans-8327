@@ -38,22 +38,46 @@ function draftKey(teamMemberId: string) {
   return `session-wizard-draft-${teamMemberId}`;
 }
 
+// Contexto opcional cuando el wizard se abre desde un proyecto/iteración
+// (/sesiones/nueva?projectId=...&iterationId=...). Ya viene validado por
+// el Server Component que renderiza SessionWizard — aquí solo se muestra
+// y se adjunta al guardar, nunca se ofrece un selector nuevo.
+export type SessionWizardContext = {
+  projectId: string;
+  projectName: string;
+  iterationId?: string;
+  iterationLabel?: string;
+};
+
+function initialStateWithContext(context?: SessionWizardContext): WizardState {
+  const base = emptyWizardState();
+  if (context) {
+    base.projectId = context.projectId;
+    base.iterationId = context.iterationId ?? null;
+  }
+  return base;
+}
+
 export function SessionWizard({
   teamMember,
   roster,
   areas,
   activityTypes,
   seasonId,
+  context,
 }: {
   teamMember: TeamMember;
   roster: TeamMember[];
   areas: Category[];
   activityTypes: Category[];
   seasonId: string;
+  context?: SessionWizardContext;
 }) {
   const router = useRouter();
   const [step, setStep] = useState(0);
-  const [state, setState] = useState<WizardState>(emptyWizardState);
+  const [state, setState] = useState<WizardState>(() =>
+    initialStateWithContext(context)
+  );
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{
     current: number;
@@ -73,8 +97,19 @@ export function SessionWizard({
       // Restauración única de un borrador externo (localStorage) hacia
       // estado editable local: no hay forma de "calcular esto durante el
       // render" porque después el usuario sigue mutando `state` libremente.
+      //
+      // El contexto de proyecto/iteración SIEMPRE se vuelve a aplicar
+      // después de mezclar el borrador: un borrador viejo pudo haberse
+      // guardado en una sesión independiente (o de otro proyecto) antes
+      // de que existiera este contexto, y no debe pisarlo silenciosamente.
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setState((current) => ({ ...current, ...draft, evidence: [] }));
+      setState((current) => ({
+        ...current,
+        ...draft,
+        evidence: [],
+        projectId: context ? context.projectId : current.projectId,
+        iterationId: context ? (context.iterationId ?? null) : current.iterationId,
+      }));
       toast.info("Recuperamos un borrador sin terminar de esta sesión.");
     } catch {
       // Borrador corrupto o localStorage no disponible: se ignora.
@@ -87,6 +122,11 @@ export function SessionWizard({
     try {
       const persistable: Partial<WizardState> = { ...state };
       delete persistable.evidence;
+      // El contexto de proyecto/iteración nunca se persiste: representa
+      // "desde dónde se abrió el wizard", no algo que deba sobrevivir
+      // entre sesiones del navegador ni aplicarse a un contexto distinto.
+      delete persistable.projectId;
+      delete persistable.iterationId;
       window.localStorage.setItem(
         draftKey(teamMember.id),
         JSON.stringify(persistable)
@@ -163,11 +203,25 @@ export function SessionWizard({
           decision: state.decision.trim() || null,
           learning: state.learning.trim() || null,
           next_step: state.nextStep.trim() || null,
+          project_id: state.projectId,
+          iteration_id: state.iterationId,
         })
         .select("id")
         .single();
 
-      if (sessionError) throw sessionError;
+      if (sessionError) {
+        // foreign_key_violation: el par project_id/iteration_id no es
+        // válido (p. ej. la iteración ya no pertenece a ese proyecto). El
+        // contexto ya se valida server-side antes de mostrar el wizard,
+        // así que esto solo debería dispararse en una condición de carrera
+        // rarísima — pero la base de datos es la autoridad final, no la UI.
+        if (sessionError.code === "23503") {
+          throw new Error(
+            "El contexto de proyecto/iteración ya no es válido. Vuelve a intentarlo."
+          );
+        }
+        throw sessionError;
+      }
       sessionId = session.id as string;
 
       if (state.participantIds.length > 0) {
@@ -281,6 +335,29 @@ export function SessionWizard({
   return (
     <Card>
       <CardContent className="flex flex-col gap-6 pt-6">
+        {context && (
+          <div className="flex flex-wrap gap-x-6 gap-y-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+            <div className="flex flex-col">
+              <span className="text-xs font-medium text-muted-foreground">
+                Proyecto
+              </span>
+              <span className="text-sm text-foreground">
+                {context.projectName}
+              </span>
+            </div>
+            {context.iterationLabel && (
+              <div className="flex flex-col">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Iteración
+                </span>
+                <span className="text-sm text-foreground">
+                  {context.iterationLabel}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
         <StepIndicator step={step} total={TOTAL_STEPS} title={STEP_TITLES[step]} />
 
         {step === 0 && (

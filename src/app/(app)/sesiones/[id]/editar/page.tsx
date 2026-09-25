@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getCurrentTeamMember, getActiveRoster } from "@/lib/queries/roster";
 import { getActiveCategories } from "@/lib/queries/categories";
+import { getVisibleProjects } from "@/lib/queries/projects";
 import { SessionEditForm } from "@/components/session-edit/session-edit-form";
 import {
   Card,
@@ -23,6 +24,8 @@ type EditableSessionRow = {
   decision: string | null;
   learning: string | null;
   next_step: string | null;
+  project_id: string | null;
+  iteration_id: string | null;
 };
 
 function BlockedState({
@@ -60,7 +63,8 @@ export default async function EditarSesionPage({
       .from("sessions")
       .select(
         `id, created_by, session_date, objective, what_happened, had_problem,
-         problem_description, decision, learning, next_step`
+         problem_description, decision, learning, next_step,
+         project_id, iteration_id`
       )
       .eq("id", id)
       .maybeSingle<EditableSessionRow>(),
@@ -83,11 +87,13 @@ export default async function EditarSesionPage({
 
   let roster;
   let categories;
+  let projects;
 
   try {
-    [roster, categories] = await Promise.all([
+    [roster, categories, projects] = await Promise.all([
       getActiveRoster(supabase),
       getActiveCategories(supabase),
+      getVisibleProjects(supabase),
     ]);
   } catch (loadError) {
     return (
@@ -149,6 +155,7 @@ export default async function EditarSesionPage({
         roster={roster}
         areas={categories.areas}
         activityTypes={categories.activityTypes}
+        projects={projects}
         initialValues={{
           sessionDate: session.session_date,
           participantIds,
@@ -165,6 +172,8 @@ export default async function EditarSesionPage({
           decision: session.decision ?? "",
           learning: session.learning ?? "",
           nextStep: session.next_step ?? "",
+          projectId: session.project_id,
+          iterationId: session.iteration_id,
         }}
       />
     </div>

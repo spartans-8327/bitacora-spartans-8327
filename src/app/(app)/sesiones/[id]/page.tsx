@@ -36,6 +36,8 @@ type SessionDetail = {
   created_at: string;
   session_participants: { team_members: { id: string; full_name: string; nickname: string | null } }[];
   session_categories: { categories: { id: string; label: string; kind: string } }[];
+  projects: { id: string; name: string } | null;
+  project_iterations: { id: string; sequence: number; name: string | null } | null;
 };
 
 type EvidenceRow = {
@@ -81,7 +83,9 @@ export default async function SesionDetailPage({
         `id, created_by, session_date, objective, what_happened, had_problem,
          problem_description, decision, learning, next_step, created_at,
          session_participants(team_members(id, full_name, nickname)),
-         session_categories(categories(id, label, kind))`
+         session_categories(categories(id, label, kind)),
+         projects(id, name),
+         project_iterations(id, sequence, name)`
       )
       .eq("id", id)
       .maybeSingle<SessionDetail>(),
@@ -161,6 +165,40 @@ export default async function SesionDetailPage({
             .join(", ")}
         </p>
       </div>
+
+      {/* Contexto de proyecto/iteración: solo se muestra si existe, para
+          no dejar una sección vacía en sesiones independientes. */}
+      {session.projects && (
+        <div className="flex flex-wrap gap-x-6 gap-y-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+          <div className="flex flex-col">
+            <span className="text-xs font-medium text-muted-foreground">
+              Proyecto
+            </span>
+            <Link
+              href={`/proyectos/${session.projects.id}`}
+              className="text-sm text-foreground hover:underline"
+            >
+              {session.projects.name}
+            </Link>
+          </div>
+          {session.project_iterations && (
+            <div className="flex flex-col">
+              <span className="text-xs font-medium text-muted-foreground">
+                Iteración
+              </span>
+              <Link
+                href={`/proyectos/${session.projects.id}/iteraciones/${session.project_iterations.id}`}
+                className="text-sm text-foreground hover:underline"
+              >
+                Iteración {session.project_iterations.sequence}
+                {session.project_iterations.name
+                  ? ` · ${session.project_iterations.name}`
+                  : ""}
+              </Link>
+            </div>
+          )}
+        </div>
+      )}
 
       <Card>
         <CardContent className="flex flex-col gap-4 pt-6">
