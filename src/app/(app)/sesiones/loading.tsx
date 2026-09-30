@@ -7,6 +7,11 @@ export default function SesionesLoading() {
         <Skeleton className="h-8 w-32" />
         <Skeleton className="h-8 w-36" />
       </div>
+      <div className="flex flex-wrap gap-2">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <Skeleton key={i} className="h-9 w-20 rounded-full" />
+        ))}
+      </div>
       <ul className="flex flex-col gap-3">
         {Array.from({ length: 4 }).map((_, i) => (
           <li key={i}>

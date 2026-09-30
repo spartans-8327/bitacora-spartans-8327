@@ -124,7 +124,6 @@ export default async function NuevaSesionPage({
       <SessionWizard
         teamMember={teamMember}
         roster={roster}
-        areas={categories.areas}
         activityTypes={categories.activityTypes}
         seasonId={season.id}
         context={context}

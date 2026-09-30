@@ -4,7 +4,11 @@ import { createClient } from "@/lib/supabase/server";
 import { getCurrentTeamMember, getActiveRoster } from "@/lib/queries/roster";
 import { getActiveCategories } from "@/lib/queries/categories";
 import { getVisibleProjects } from "@/lib/queries/projects";
+import type { SessionArea } from "@/lib/queries/sessions";
+import { getSpecializedRecord } from "@/lib/queries/specialized-records";
+import { getEvidenceForSession } from "@/lib/queries/evidence";
 import { SessionEditForm } from "@/components/session-edit/session-edit-form";
+import { emptySpecializationDraft } from "@/components/session-wizard/types";
 import {
   Card,
   CardDescription,
@@ -26,6 +30,10 @@ type EditableSessionRow = {
   next_step: string | null;
   project_id: string | null;
   iteration_id: string | null;
+  area: SessionArea | null;
+  start_time: string | null;
+  end_time: string | null;
+  season_id: string;
 };
 
 function BlockedState({
@@ -64,7 +72,7 @@ export default async function EditarSesionPage({
       .select(
         `id, created_by, session_date, objective, what_happened, had_problem,
          problem_description, decision, learning, next_step,
-         project_id, iteration_id`
+         project_id, iteration_id, area, start_time, end_time, season_id`
       )
       .eq("id", id)
       .maybeSingle<EditableSessionRow>(),
@@ -88,12 +96,17 @@ export default async function EditarSesionPage({
   let roster;
   let categories;
   let projects;
+  let specializedRecord;
 
   try {
-    [roster, categories, projects] = await Promise.all([
+    [roster, categories, projects, specializedRecord] = await Promise.all([
       getActiveRoster(supabase),
       getActiveCategories(supabase),
       getVisibleProjects(supabase),
+      // Incondicional a propósito: si el área no es técnica esto siempre
+      // devuelve null (el trigger de 0005 garantiza que nunca exista un
+      // registro para area = team/NULL), no hace falta ramificar antes.
+      getSpecializedRecord(supabase, id),
     ]);
   } catch (loadError) {
     return (
@@ -104,6 +117,18 @@ export default async function EditarSesionPage({
         }`}
       />
     );
+  }
+
+  // Aislado del resto a propósito: si falla la carga de evidencia, el
+  // usuario debe poder seguir editando el resto de la sesión — no tiene
+  // sentido bloquear todo el formulario por esto.
+  let evidence: Awaited<ReturnType<typeof getEvidenceForSession>> = [];
+  try {
+    evidence = await getEvidenceForSession(supabase, id);
+  } catch {
+    // EvidenceManager recibe una lista vacía; el usuario puede reintentar
+    // recargando la página. No hace falta un estado de error dedicado
+    // aquí — es la misma tolerancia que ya tiene el detalle de sesión.
   }
 
   const [participantsRes, categoriesRes] = await Promise.all([
@@ -152,19 +177,29 @@ export default async function EditarSesionPage({
       </div>
       <SessionEditForm
         sessionId={session.id}
+        seasonId={session.season_id}
+        uploadedBy={currentMember.id}
         roster={roster}
         areas={categories.areas}
         activityTypes={categories.activityTypes}
         projects={projects}
+        hasExistingSpecializedRecord={specializedRecord !== null}
+        initialSpecializedRecordDetails={specializedRecord?.details ?? {}}
+        initialEvidence={evidence}
         initialValues={{
           sessionDate: session.session_date,
           participantIds,
-          areaIds: sessionCategoryIds.filter(
-            (cid) => !activityTypeIdSet.has(cid)
-          ),
+          area: session.area,
+          startTime: session.start_time ?? "",
+          endTime: session.end_time ?? "",
+          // Solo se recupera del modelo legacy si la sesión YA es de
+          // Equipo bajo el modelo nuevo — no se traduce ninguna etiqueta
+          // vieja para otras áreas (ver Fase 4, regla de no-traducción).
           activityTypeId:
-            sessionCategoryIds.find((cid) => activityTypeIdSet.has(cid)) ??
-            null,
+            session.area === "team"
+              ? sessionCategoryIds.find((cid) => activityTypeIdSet.has(cid)) ??
+                null
+              : null,
           objective: session.objective,
           whatHappened: session.what_happened,
           hadProblem: session.had_problem,
@@ -174,6 +209,15 @@ export default async function EditarSesionPage({
           nextStep: session.next_step ?? "",
           projectId: session.project_id,
           iterationId: session.iteration_id,
+          specialization: specializedRecord
+            ? {
+                workType: specializedRecord.work_type,
+                subject: specializedRecord.subject,
+                status: specializedRecord.status,
+                blockedReason: specializedRecord.blocked_reason ?? "",
+                blockedNeeds: specializedRecord.blocked_needs ?? "",
+              }
+            : emptySpecializationDraft(),
         }}
       />
     </div>

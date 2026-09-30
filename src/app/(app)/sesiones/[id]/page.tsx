@@ -2,6 +2,9 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getCurrentTeamMember } from "@/lib/queries/roster";
+import { SESSION_AREA_LABELS, type SessionArea } from "@/lib/queries/sessions";
+import { getSpecializedRecord } from "@/lib/queries/specialized-records";
+import { getEvidenceForSession } from "@/lib/queries/evidence";
 import {
   Card,
   CardContent,
@@ -11,13 +14,9 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DeleteSessionButton } from "@/components/session-delete-button";
+import { EvidenceIcon } from "@/components/evidence-icon";
 import {
   ArrowLeft,
-  Image as ImageIcon,
-  VideoCamera,
-  Paperclip,
-  LinkSimple,
-  FileText,
   PencilSimple,
   Warning,
 } from "@phosphor-icons/react/dist/ssr";
@@ -34,29 +33,16 @@ type SessionDetail = {
   learning: string | null;
   next_step: string | null;
   created_at: string;
+  area: SessionArea | null;
+  start_time: string | null;
+  end_time: string | null;
   session_participants: { team_members: { id: string; full_name: string; nickname: string | null } }[];
-  session_categories: { categories: { id: string; label: string; kind: string } }[];
+  // Solo relevante cuando area = 'team' (Fase 4, regla 4): la actividad
+  // general de Equipo, sin specialized_record equivalente.
+  session_categories: { categories: { label: string } }[];
   projects: { id: string; name: string } | null;
   project_iterations: { id: string; sequence: number; name: string | null } | null;
 };
-
-type EvidenceRow = {
-  id: string;
-  kind: "photo" | "video" | "file" | "link" | "document" | "code_commit" | "other";
-  storage_path: string | null;
-  external_url: string | null;
-  title: string | null;
-};
-
-const EVIDENCE_ICON = {
-  photo: ImageIcon,
-  video: VideoCamera,
-  file: Paperclip,
-  link: LinkSimple,
-  document: FileText,
-  code_commit: FileText,
-  other: FileText,
-} as const;
 
 function Field({ label, value }: { label: string; value: string | null }) {
   if (!value) return null;
@@ -82,8 +68,9 @@ export default async function SesionDetailPage({
       .select(
         `id, created_by, session_date, objective, what_happened, had_problem,
          problem_description, decision, learning, next_step, created_at,
+         area, start_time, end_time,
          session_participants(team_members(id, full_name, nickname)),
-         session_categories(categories(id, label, kind)),
+         session_categories(categories(label)),
          projects(id, name),
          project_iterations(id, sequence, name)`
       )
@@ -94,25 +81,23 @@ export default async function SesionDetailPage({
 
   if (error || !session) notFound();
 
+  // Incondicional a propósito: si el área no es técnica esto siempre
+  // devuelve null (el trigger de 0005 lo garantiza) — no hace falta
+  // ramificar antes de pedirlo.
+  const specializedRecord = await getSpecializedRecord(supabase, id);
+
   const canEdit =
     !!currentMember &&
     (currentMember.id === session.created_by || currentMember.role === "admin");
 
-  const { data: evidenceRows, error: evidenceError } = await supabase
-    .from("evidence")
-    .select("id, kind, storage_path, external_url, title")
-    .eq("session_id", id)
-    .returns<EvidenceRow[]>();
-
-  const evidence = await Promise.all(
-    (evidenceRows ?? []).map(async (item) => {
-      if (!item.storage_path) return { ...item, href: item.external_url };
-      const { data: signed } = await supabase.storage
-        .from("evidence")
-        .createSignedUrl(item.storage_path, 60 * 60);
-      return { ...item, href: signed?.signedUrl ?? null };
-    })
-  );
+  let evidence: Awaited<ReturnType<typeof getEvidenceForSession>> = [];
+  let evidenceErrorMessage: string | null = null;
+  try {
+    evidence = await getEvidenceForSession(supabase, id);
+  } catch (evidenceError) {
+    evidenceErrorMessage =
+      evidenceError instanceof Error ? evidenceError.message : String(evidenceError);
+  }
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-6 py-10">
@@ -147,11 +132,22 @@ export default async function SesionDetailPage({
         </p>
         <h1 className="font-heading text-2xl font-semibold">{session.objective}</h1>
         <div className="flex flex-wrap gap-1.5">
-          {session.session_categories?.map(({ categories: category }) => (
-            <Badge key={category.id} variant="secondary">
-              {category.label}
+          {/* sessions.area es la única fuente de verdad del área (Fase 4/5):
+              sin respaldo de session_categories como área — la estructura
+              actual no necesita compatibilidad con el modelo histórico.
+              Equipo sí sigue usando session_categories, pero solo para su
+              actividad general (Fase 4, regla 4), no como área. */}
+          {session.area && (
+            <Badge variant="secondary">{SESSION_AREA_LABELS[session.area]}</Badge>
+          )}
+          {specializedRecord && (
+            <Badge variant="outline">{specializedRecord.work_type}</Badge>
+          )}
+          {session.area === "team" && session.session_categories[0] && (
+            <Badge variant="outline">
+              {session.session_categories[0].categories.label}
             </Badge>
-          ))}
+          )}
           {session.had_problem && (
             <Badge variant="outline" className="border-warning text-warning">
               Con problema
@@ -212,20 +208,20 @@ export default async function SesionDetailPage({
 
       <div className="flex flex-col gap-3">
         <h2 className="font-heading text-lg font-semibold">Evidencia</h2>
-        {evidenceError && (
+        {evidenceErrorMessage && (
           <Card className="border-warning/40">
             <CardHeader className="flex-row items-start gap-3 space-y-0">
               <Warning className="mt-1 size-5 shrink-0 text-warning" aria-hidden />
               <div>
                 <CardDescription>
                   No se pudo cargar la evidencia de esta sesión. Detalle:{" "}
-                  {evidenceError.message}
+                  {evidenceErrorMessage}
                 </CardDescription>
               </div>
             </CardHeader>
           </Card>
         )}
-        {!evidenceError && evidence.length === 0 && (
+        {!evidenceErrorMessage && evidence.length === 0 && (
           <Card>
             <CardHeader>
               <CardDescription>
@@ -235,22 +231,22 @@ export default async function SesionDetailPage({
           </Card>
         )}
         <ul className="flex flex-col gap-2">
-          {evidence.map((item) => {
-            const Icon = EVIDENCE_ICON[item.kind];
-            return (
-              <li key={item.id}>
-                <a
-                  href={item.href ?? "#"}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm hover:bg-accent"
-                >
-                  <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="truncate">{item.title || item.href}</span>
-                </a>
-              </li>
-            );
-          })}
+          {evidence.map((item) => (
+            <li key={item.id}>
+              <a
+                href={item.href ?? "#"}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm hover:bg-accent"
+              >
+                <EvidenceIcon
+                  kind={item.kind}
+                  className="size-4 shrink-0 text-muted-foreground"
+                />
+                <span className="truncate">{item.title || item.href}</span>
+              </a>
+            </li>
+          ))}
         </ul>
       </div>
     </div>

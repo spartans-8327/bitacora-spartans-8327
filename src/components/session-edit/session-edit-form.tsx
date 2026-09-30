@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -11,6 +11,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent } from "@/components/ui/card";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -20,35 +28,66 @@ import {
 import type { TeamMember } from "@/lib/queries/roster";
 import type { Category } from "@/lib/queries/categories";
 import type { Project } from "@/lib/queries/projects";
-import type { WizardState } from "@/components/session-wizard/types";
+import type { SessionArea } from "@/lib/queries/sessions";
+import type { SessionWizardState } from "@/components/session-wizard/types";
+import { emptySpecializationDraft } from "@/components/session-wizard/types";
 import { MemberPicker } from "@/components/session-wizard/member-picker";
 import { ChipPicker } from "@/components/session-wizard/chip-picker";
+import { AreaPicker } from "@/components/session-wizard/area-picker";
+import { SpecializationStep } from "@/components/session-wizard/specialization-step";
 import { DictationTextarea } from "@/components/session-wizard/dictation-textarea";
-import { sessionWizardSchema } from "@/lib/validation/session";
+import { EvidenceManager } from "@/components/session-edit/evidence-manager";
+import type { EvidenceWithUrl } from "@/lib/queries/evidence";
+import {
+  specializedRecordSchema,
+  type SpecializedRecord,
+} from "@/lib/validation/specialized-record";
+import {
+  createSpecializedRecord,
+  updateSpecializedRecord,
+} from "@/lib/queries/specialized-records";
 import {
   getIterationsByProject,
   type ProjectIteration,
 } from "@/lib/queries/project-iterations";
 
-type EditableFields = Omit<WizardState, "evidence">;
+type EditableFields = Omit<SessionWizardState, "evidence">;
 
 // Sentinel para representar "sin proyecto"/"sin iteración" en los Select
 // de Radix, que no aceptan value="" de forma confiable.
 const NONE_VALUE = "none";
 
+function nowAsTime(): string {
+  return new Date().toTimeString().slice(0, 5);
+}
+
 export function SessionEditForm({
   sessionId,
+  seasonId,
+  uploadedBy,
   roster,
   areas,
   activityTypes,
   projects,
+  hasExistingSpecializedRecord,
+  initialSpecializedRecordDetails,
+  initialEvidence,
   initialValues,
 }: {
   sessionId: string;
+  seasonId: string;
+  uploadedBy: string;
   roster: TeamMember[];
+  // Ya no se usa para elegir área (eso vive en sessions.area, selección
+  // única) — solo para identificar y limpiar etiquetas legacy de área en
+  // session_categories al guardar (Fase 4: sessions.area es la única
+  // fuente de verdad).
   areas: Category[];
   activityTypes: Category[];
   projects: Project[];
+  hasExistingSpecializedRecord: boolean;
+  initialSpecializedRecordDetails: Record<string, unknown>;
+  initialEvidence: EvidenceWithUrl[];
   initialValues: EditableFields;
 }) {
   const router = useRouter();
@@ -59,12 +98,64 @@ export function SessionEditForm({
   const [submitting, setSubmitting] = useState(false);
   const [iterations, setIterations] = useState<ProjectIteration[]>([]);
   const [loadingIterations, setLoadingIterations] = useState(false);
+  const [areaChangeDialogOpen, setAreaChangeDialogOpen] = useState(false);
+  const [pendingArea, setPendingArea] = useState<SessionArea | null>(null);
+
+  // Capturados una sola vez, al montar — nunca deben recalcularse cuando
+  // el usuario edita el formulario, solo reflejan con qué llegó cargada
+  // la sesión desde el servidor.
+  const initialAreaRef = useRef(initialValues.area);
+  const hadExistingSpecializedRecordRef = useRef(hasExistingSpecializedRecord);
+  const loadedDetailsRef = useRef(initialSpecializedRecordDetails);
 
   function update<K extends keyof EditableFields>(
     key: K,
     value: EditableFields[K]
   ) {
     setState((current) => ({ ...current, [key]: value }));
+  }
+
+  function updateSpecialization(patch: Partial<EditableFields["specialization"]>) {
+    setState((current) => ({
+      ...current,
+      specialization: { ...current.specialization, ...patch },
+    }));
+  }
+
+  // Cambiar de área siempre descarta la clasificación anterior — nunca se
+  // intenta "traducir" una especialización de un área a otra, igual que
+  // en session-wizard.tsx y en el trigger de la base de datos
+  // (sessions_discard_specialized_record_on_area_change).
+  function applyAreaChange(newArea: SessionArea) {
+    setState((current) => ({
+      ...current,
+      area: newArea,
+      activityTypeId: null,
+      specialization: emptySpecializationDraft(),
+    }));
+  }
+
+  // Solo pide confirmación cuando hay algo real que perder: si todavía
+  // no había ningún área elegida, o si se vuelve a elegir la misma, no
+  // hace falta interrumpir con un diálogo.
+  function requestAreaChange(newArea: SessionArea) {
+    if (state.area === null || newArea === state.area) {
+      applyAreaChange(newArea);
+      return;
+    }
+    setPendingArea(newArea);
+    setAreaChangeDialogOpen(true);
+  }
+
+  function confirmAreaChange() {
+    if (pendingArea) applyAreaChange(pendingArea);
+    setAreaChangeDialogOpen(false);
+    setPendingArea(null);
+  }
+
+  function cancelAreaChange() {
+    setAreaChangeDialogOpen(false);
+    setPendingArea(null);
   }
 
   // Recarga las iteraciones disponibles cada vez que cambia el proyecto
@@ -107,20 +198,83 @@ export function SessionEditForm({
 
   const availableIterations = state.projectId ? iterations : [];
 
+  const scheduleOrderValid = !(
+    state.startTime && state.endTime && state.endTime < state.startTime
+  );
+
+  function validateBaseFields(): Partial<Record<keyof EditableFields, string>> {
+    const fieldErrors: Partial<Record<keyof EditableFields, string>> = {};
+    if (!state.sessionDate) fieldErrors.sessionDate = "Elige una fecha.";
+    if (state.participantIds.length === 0) {
+      fieldErrors.participantIds = "Selecciona al menos un participante.";
+    }
+    if (!state.area) {
+      fieldErrors.area = "Selecciona un área responsable.";
+    }
+    if (state.area === "team" && !state.activityTypeId) {
+      fieldErrors.activityTypeId = "Elige el tipo de actividad.";
+    }
+    if (state.objective.trim().length < 3) {
+      fieldErrors.objective = "Cuéntanos qué querían conseguir.";
+    }
+    if (state.whatHappened.trim().length < 3) {
+      fieldErrors.whatHappened = "Cuéntanos qué ocurrió.";
+    }
+    if (state.hadProblem === null) {
+      fieldErrors.hadProblem = "Indica si hubo un problema.";
+    } else if (state.hadProblem && state.problemDescription.trim().length < 3) {
+      fieldErrors.problemDescription = "Describe brevemente el problema.";
+    }
+    if (!scheduleOrderValid) {
+      fieldErrors.endTime =
+        "La hora de finalización no puede ser antes de la de inicio.";
+    }
+    return fieldErrors;
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
 
-    const parsed = sessionWizardSchema.safeParse(state);
-    if (!parsed.success) {
-      const fieldErrors: Partial<Record<keyof EditableFields, string>> = {};
-      for (const issue of parsed.error.issues) {
-        const key = issue.path[0] as keyof EditableFields;
-        if (!fieldErrors[key]) fieldErrors[key] = issue.message;
-      }
+    const fieldErrors = validateBaseFields();
+    if (Object.keys(fieldErrors).length > 0) {
       setErrors(fieldErrors);
       toast.error("Revisa los campos marcados antes de guardar.");
       return;
     }
+
+    const areaChanged = state.area !== initialAreaRef.current;
+
+    // El área ya se validó como no-nula arriba (validateBaseFields), pero
+    // TypeScript no puede inferir eso a través de la llamada a esa
+    // función — por eso el `!!state.area` explícito aquí también.
+    const isTechnicalArea = !!state.area && state.area !== "team";
+    let specializedPayload: SpecializedRecord | null = null;
+
+    if (isTechnicalArea && state.area) {
+      const candidate = {
+        area: state.area,
+        workType: state.specialization.workType,
+        subject: state.specialization.subject,
+        status: state.specialization.status ?? undefined,
+        blockedReason: state.specialization.blockedReason.trim() || undefined,
+        blockedNeeds: state.specialization.blockedNeeds.trim() || undefined,
+        // Si el área no cambió y ya existía un registro, se conserva su
+        // `details` tal cual — todavía no hay UI para editarlo y no debe
+        // perderse por una edición de otros campos. Si el área cambió (o
+        // nunca existió un registro), se empieza desde cero.
+        details:
+          !areaChanged && hadExistingSpecializedRecordRef.current
+            ? loadedDetailsRef.current
+            : {},
+      };
+      const parsed = specializedRecordSchema.safeParse(candidate);
+      if (!parsed.success) {
+        toast.error("Completa correctamente la especialización antes de guardar.");
+        return;
+      }
+      specializedPayload = parsed.data;
+    }
+
     setErrors({});
     setSubmitting(true);
     const supabase = createClient();
@@ -129,8 +283,12 @@ export function SessionEditForm({
       // OJO: si una política de RLS bloquea este UPDATE, Postgres no lanza
       // un error — simplemente afecta 0 filas y PostgREST responde éxito
       // igual. Por eso pedimos las filas afectadas con `.select("id")` y
-      // tratamos "0 filas" como un fallo explícito (p. ej. si el permiso
-      // cambió entre que se cargó la página y que se guardó).
+      // tratamos "0 filas" como un fallo explícito.
+      //
+      // Si `area` cambió, el trigger sessions_discard_specialized_record_on
+      // _area_change (migración 0005) ya elimina por su cuenta cualquier
+      // specialized_record anterior — esa es la protección principal, no
+      // se duplica aquí ningún borrado manual.
       const { data: updatedRows, error: updateError } = await supabase
         .from("sessions")
         .update({
@@ -144,12 +302,11 @@ export function SessionEditForm({
           decision: state.decision.trim() || null,
           learning: state.learning.trim() || null,
           next_step: state.nextStep.trim() || null,
-          // El Select de iteración solo ofrece iteraciones del proyecto ya
-          // elegido, así que la UI no puede armar una combinación inválida
-          // por sí sola — pero la base de datos (FK compuesta) sigue
-          // siendo la autoridad final, no esta pantalla.
           project_id: state.projectId,
           iteration_id: state.iterationId,
+          area: state.area,
+          start_time: state.startTime || null,
+          end_time: state.endTime || null,
         })
         .eq("id", sessionId)
         .select("id");
@@ -183,24 +340,49 @@ export function SessionEditForm({
         if (error) throw error;
       }
 
-      const { error: deleteCategoriesError } = await supabase
-        .from("session_categories")
-        .delete()
-        .eq("session_id", sessionId);
-      if (deleteCategoriesError) throw deleteCategoriesError;
-
-      const categoryIds = [
-        ...state.areaIds,
-        ...(state.activityTypeId ? [state.activityTypeId] : []),
-      ];
-      if (categoryIds.length > 0) {
-        const { error } = await supabase.from("session_categories").insert(
-          categoryIds.map((category_id) => ({
-            session_id: sessionId,
-            category_id,
-          }))
-        );
+      // sessions.area es la única fuente de verdad del área (Fase 4): las
+      // etiquetas legacy de kind='area' en session_categories se eliminan
+      // siempre, sin excepción. Las de kind='activity_type' se limpian y
+      // se vuelven a escribir solo si el área actual es Equipo — para
+      // cualquier área técnica, ninguna de las dos debe quedar.
+      const areaCategoryIds = areas.map((a) => a.id);
+      if (areaCategoryIds.length > 0) {
+        const { error } = await supabase
+          .from("session_categories")
+          .delete()
+          .eq("session_id", sessionId)
+          .in("category_id", areaCategoryIds);
         if (error) throw error;
+      }
+
+      const activityTypeCategoryIds = activityTypes.map((a) => a.id);
+      if (activityTypeCategoryIds.length > 0) {
+        const { error } = await supabase
+          .from("session_categories")
+          .delete()
+          .eq("session_id", sessionId)
+          .in("category_id", activityTypeCategoryIds);
+        if (error) throw error;
+      }
+
+      if (state.area === "team" && state.activityTypeId) {
+        const { error } = await supabase.from("session_categories").insert({
+          session_id: sessionId,
+          category_id: state.activityTypeId,
+        });
+        if (error) throw error;
+      }
+
+      // Registro especializado: solo áreas técnicas. Si el área cambió,
+      // el trigger ya eliminó el registro anterior (ver comentario
+      // arriba) — aquí solo decidimos crear uno nuevo o actualizar el
+      // existente, nunca borrar.
+      if (isTechnicalArea && specializedPayload) {
+        if (!areaChanged && hadExistingSpecializedRecordRef.current) {
+          await updateSpecializedRecord(supabase, sessionId, specializedPayload);
+        } else {
+          await createSpecializedRecord(supabase, sessionId, specializedPayload);
+        }
       }
 
       toast.success("Cambios guardados.");
@@ -250,44 +432,95 @@ export function SessionEditForm({
             </div>
           </div>
 
-          <div className="flex flex-col gap-3 border-t border-border pt-6">
+          <div className="flex flex-col gap-4 border-t border-border pt-6">
             <h2 className="font-heading text-lg font-semibold">
-              ¿Qué área trabajaron?
+              Horario (opcional)
             </h2>
-            <ChipPicker
-              options={areas.map((a) => ({ id: a.id, label: a.label }))}
-              selectedIds={state.areaIds}
-              onToggle={(id) =>
-                update(
-                  "areaIds",
-                  state.areaIds.includes(id)
-                    ? state.areaIds.filter((existing) => existing !== id)
-                    : [...state.areaIds, id]
-                )
-              }
-            />
-            {errors.areaIds && (
-              <p className="text-sm text-destructive">{errors.areaIds}</p>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="edit-start-time">Hora de inicio</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="edit-start-time"
+                    type="time"
+                    value={state.startTime}
+                    onChange={(e) => update("startTime", e.target.value)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => update("startTime", nowAsTime())}
+                  >
+                    Ahora
+                  </Button>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="edit-end-time">Hora de finalización</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="edit-end-time"
+                    type="time"
+                    value={state.endTime}
+                    onChange={(e) => update("endTime", e.target.value)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => update("endTime", nowAsTime())}
+                  >
+                    Ahora
+                  </Button>
+                </div>
+              </div>
+            </div>
+            {errors.endTime && (
+              <p className="text-sm text-destructive">{errors.endTime}</p>
             )}
           </div>
 
           <div className="flex flex-col gap-3 border-t border-border pt-6">
             <h2 className="font-heading text-lg font-semibold">
-              Tipo de actividad
+              ¿Qué área es responsable?
             </h2>
-            <ChipPicker
-              options={activityTypes.map((a) => ({ id: a.id, label: a.label }))}
-              selectedIds={state.activityTypeId ? [state.activityTypeId] : []}
-              onToggle={(id) =>
-                update("activityTypeId", state.activityTypeId === id ? null : id)
-              }
-            />
-            {errors.activityTypeId && (
-              <p className="text-sm text-destructive">
-                {errors.activityTypeId}
-              </p>
+            <AreaPicker value={state.area} onChange={requestAreaChange} />
+            {errors.area && (
+              <p className="text-sm text-destructive">{errors.area}</p>
             )}
           </div>
+
+          {state.area === "team" && (
+            <div className="flex flex-col gap-3 border-t border-border pt-6">
+              <h2 className="font-heading text-lg font-semibold">
+                Tipo de actividad
+              </h2>
+              <ChipPicker
+                options={activityTypes.map((a) => ({ id: a.id, label: a.label }))}
+                selectedIds={state.activityTypeId ? [state.activityTypeId] : []}
+                onToggle={(id) =>
+                  update("activityTypeId", state.activityTypeId === id ? null : id)
+                }
+              />
+              {errors.activityTypeId && (
+                <p className="text-sm text-destructive">
+                  {errors.activityTypeId}
+                </p>
+              )}
+            </div>
+          )}
+
+          {state.area && state.area !== "team" && (
+            <div className="flex flex-col gap-3 border-t border-border pt-6">
+              <h2 className="font-heading text-lg font-semibold">
+                Especialización
+              </h2>
+              <SpecializationStep
+                area={state.area}
+                value={state.specialization}
+                onChange={updateSpecialization}
+              />
+            </div>
+          )}
 
           <div className="border-t border-border pt-6">
             <DictationTextarea
@@ -451,6 +684,21 @@ export function SessionEditForm({
             </div>
           </div>
 
+          <div className="flex flex-col gap-3 border-t border-border pt-6">
+            <h2 className="font-heading text-lg font-semibold">Evidencia</h2>
+            {/*
+              Independiente del resto del formulario a propósito: no lee
+              ni escribe `state`, así que guardar cambios en cualquier
+              otro campo nunca toca la evidencia (Fase 5, Parte A4).
+            */}
+            <EvidenceManager
+              sessionId={sessionId}
+              seasonId={seasonId}
+              uploadedBy={uploadedBy}
+              initialEvidence={initialEvidence}
+            />
+          </div>
+
           <div className="flex items-center justify-between border-t border-border pt-6">
             <Button asChild variant="ghost" className="gap-1.5">
               <Link href={`/sesiones/${sessionId}`}>
@@ -464,6 +712,33 @@ export function SessionEditForm({
           </div>
         </form>
       </CardContent>
+
+      <Dialog
+        open={areaChangeDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) cancelAreaChange();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>¿Cambiar de área?</DialogTitle>
+            <DialogDescription>
+              Cambiar el área descartará la especialización o el tipo de
+              actividad que ya capturaste en este formulario — no se
+              traduce de una área a otra, se empieza desde cero. Esto se
+              aplica hasta que guardes los cambios.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={cancelAreaChange}>
+              Cancelar
+            </Button>
+            <Button type="button" onClick={confirmAreaChange}>
+              Sí, cambiar de área
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
